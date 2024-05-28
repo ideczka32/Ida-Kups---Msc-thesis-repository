@@ -1,0 +1,175 @@
+"""
+Analysis pipeline for
+
+"""
+import os
+
+configfile: 'config.yaml'
+
+localrules: all, ok
+
+ASSEMBLIES = ["GRCh38", "GRCm38"]
+RELEASES = ["104", "102"]
+
+assembly2geve = {
+    "GRCh38": "Hsap38",
+    "GRCm38": "Mmus38",
+}
+
+assembly2species = {
+    "GRCh38": "homo_sapiens",
+    "GRCm38": "mus_musculus",
+}
+
+rule all:
+    input: 'OK'
+
+
+rule download_ensembl_genome:
+    output: "{assembly}-{release}/ensembl/{assembly}-{release}.dna.fa",
+    params:
+        species=lambda wc: assembly2species[f"{wc.assembly}"],
+        Species=lambda wc: assembly2species[f"{wc.assembly}"].capitalize(),
+    shell:
+        "wget -O {output}.gz http://ftp.ensembl.org/pub/release-{wildcards.release}/fasta/{params.species}/dna/{params.Species}.{wildcards.assembly}.dna.primary_assembly.fa.gz && "
+        "gunzip {output}.gz"
+
+
+rule download_ensembl_cdna:
+    output: "{assembly}-{release}/ensembl/{assembly}-{release}.cdna.all.fa",
+    params:
+        species=lambda wc: assembly2species[f"{wc.assembly}"],
+        Species=lambda wc: assembly2species[f"{wc.assembly}"].capitalize(),
+    shell:
+        "wget -O {output}.gz http://ftp.ensembl.org/pub/release-{wildcards.release}/fasta/{params.species}/cdna/{params.Species}.{wildcards.assembly}.cdna.all.fa.gz && "
+        "gunzip {output}.gz"
+
+
+rule download_ensembl_gtf:
+    output: "{assembly}-{release}/ensembl/{assembly}-{release}.gtf",
+    params:
+        species=lambda wc: assembly2species[f"{wc.assembly}"],
+        Species=lambda wc: assembly2species[f"{wc.assembly}"].capitalize(),
+    shell:
+        "wget -O {output}.gz http://ftp.ensembl.org/pub/release-{wildcards.release}/gtf/{params.species}/{params.Species}.{wildcards.assembly}.{wildcards.release}.gtf.gz && "
+        "gunzip {output}.gz"
+
+
+rule download_geve_cdna:
+    output: "{assembly}-{release}/geve/{assembly}.geve.v1.nt.fa"
+    params:
+        geve=lambda wc: assembly2geve[f"{wc.assembly}"]
+    shell:
+        "wget -O {output}.bz2 http://geve.med.u-tokai.ac.jp/download_data/nt_fasta/{params.geve}.geve.nt_v1.fa.bz2 && "
+        "bzip2 -d {output}.bz2"
+
+
+rule download_geve_gtf:
+    output: "{assembly}-{release}/geve/{assembly}.geve.v1.gtf"
+    params:
+        geve=lambda wc: assembly2geve[f"{wc.assembly}"]
+    shell:
+        "wget -O {output}.bz2 http://geve.med.u-tokai.ac.jp/download_data/gtf/{params.geve}.geve.v1.gtf.bz2 && "
+        "bzip2 -d {output}.bz2"
+
+
+rule prep_geve_gtf:
+    input: rules.download_geve_gtf.output
+    output: "{assembly}-{release}/geve/{assembly}.geve.v1.prepped.gtf"
+    run:
+        import pandas as pd
+        import csv
+        df = pd.read_table(input[0], header=None)
+
+        df[2] = "transcript"
+        df.to_csv(output[0], header=False, index=False,
+                  sep="\t", quoting=csv.QUOTE_NONE)
+
+        df[2] = "exon"
+        df.to_csv(output[0], header=False, index=False,
+                  sep="\t", mode='a', quoting=csv.QUOTE_NONE)
+
+
+rule concat_gtf:
+    input:
+        ensembl=rules.download_ensembl_gtf.output,
+        geve=rules.prep_geve_gtf.output,
+    output:
+        "{assembly}-{release}/ensembl+geve/{assembly}-{release}.with_geve_v1.gtf"
+    shell:
+        "cat {input.ensembl} {input.geve} > {output}"
+
+
+rule remove_geve_alt_contigs:
+    input: rules.download_geve_cdna.output,
+    output: "{assembly}-{release}/geve/{assembly}.geve.v1.nt.without_alts.fa"
+    singularity: config['singularity']
+    shell:
+        "samtools faidx {input} && "
+        "grep -v ^Mmus38.MG {input}.fai | cut -f1 | samtools faidx -o {output} -r - {input}"
+
+
+rule concat_cdna:
+    input:
+        ensembl=rules.download_ensembl_cdna.output,
+        geve=rules.remove_geve_alt_contigs.output,
+    output:
+        "{assembly}-{release}/ensembl+geve/{assembly}-{release}.with_geve_v1.cdna.fa"
+    shell:
+        "cat {input.ensembl} {input.geve} > {output}"
+
+
+rule fasta_index_genome:
+    input: rules.download_ensembl_genome.output
+    output: "{assembly}-{release}/ensembl/{assembly}-{release}.dna.fa.fai",
+    singularity: config['singularity']
+    shell:
+        "samtools faidx {input}"
+
+
+rule star_index:
+    input:
+        genome=rules.download_ensembl_genome.output,
+        gtf=rules.concat_gtf.output,
+    output:
+        touch("{assembly}-{release}/star/{assembly}-{release}_geve_v1/OK"),
+        dir=directory("{assembly}-{release}/star/{assembly}-{release}_geve_v1")
+    threads: 28
+    singularity: config['singularity']
+    shell:
+        "STAR --runThreadN {threads} --runMode genomeGenerate --genomeFastaFiles {input.genome} --sjdbGTFfile {input.gtf} --genomeDir {output.dir}"
+
+
+rule rsem_index:
+    input:
+        genome=rules.download_ensembl_genome.output,
+        gtf=rules.concat_gtf.output,
+    output:
+        touch("{assembly}-{release}/rsem/{assembly}-{release}_geve_v1.OK"),
+    params:
+        prefix="{assembly}-{release}/rsem/{assembly}-{release}_geve_v1"
+    singularity: config['singularity']
+    shell:
+        "rsem-prepare-reference --gtf {input.gtf} {input.genome} {params.prefix}"
+
+
+rule bismark_index:
+   input: rules.download_ensembl_genome.output, #reference genome
+   output: touch("{assembly}-{release}/ensembl/bismark.OK"),
+   params:
+        prefix = "{assembly}-{release}/ensembl"  
+   singularity: config['singularity']
+   shell:
+       """
+       bismark_genome_preparation --bowtie2 --verbose {params.prefix} 
+       """
+
+
+rule ok:
+    """Collects all output from above and writes the OK file for `rule all`."""
+    input:
+        faidx=expand(rules.fasta_index_genome.output, zip, assembly=ASSEMBLIES, release=RELEASES),
+        star=expand(rules.star_index.output, zip, assembly=ASSEMBLIES, release=RELEASES),
+        rsem=expand(rules.rsem_index.output, zip, assembly=ASSEMBLIES, release=RELEASES),
+        bismark=expand(rules.bismark_index.output, zip, assembly=ASSEMBLIES, release=RELEASES),
+    output: touch('OK')

@@ -1,0 +1,322 @@
+"""
+Analysis pipeline for paired end reads
+
+Author: Ida Kups (iku)
+"""
+import os
+import pathlib
+import pandas as pd
+import metadata_df
+
+
+configfile: 'config_evaxion.yaml'
+
+localrules: all, ok
+
+rule all:
+    input: 'results/OK'
+
+TMPDIR="/scratch-fast"
+
+#FILL IN WITH DATASET OF CHOICE
+#PROJECTS = ['DNMT3A'] #list with a projectname
+PROJECTS = ['DNMT1']
+
+# wgbs_df = metadata_df.DNMT_wgbs #metadata for WGBS part
+# rnaseq_df = metadata_df.DNMT_rnaseq
+#wgbs_df = metadata_df.nzm_wgbs_df
+rnaseq_df = metadata_df.DNMT1_rnaseq
+wgbs_df = metadata_df.DNMT1_wgbs
+
+prj2ref = {
+     'DNMT3A':'mouse',
+     'TET2':'mouse',
+     'NZM':'human',
+     'DNMT1':'human'
+}
+
+r2_issue_prjs = ['DNMT3A']
+
+rule fetch_sra:
+    output:
+        # {sra_id} wc used globaly instead of "sample" so that naming scheme
+        # follows SRA-ID to ensure correct function of prefetch so that the
+        # whole directory is downlaed with potential reference sequences
+        # this also allows for correct execution of fasterq-dump using the
+        # SRA-id directory as input e.g "SRRXXXX" with resulting in full
+        # download of all files again (which is default for fasterq-dump
+        # if it cannot find the correct ID)
+        sra=temp(directory("results/00_sra/{project}/{patient_id}/{technique}/{sra_id}")),
+    params:
+        prefix=lambda wc, output: str(pathlib.Path(output[0]).parent),  #computes the prefix (parent directory) for the prefetch command
+        ngc= lambda wc: os.path.realpath(config["ngc_token"])
+    shadow:
+        "minimal"
+        #reduce amount of detailed information in the log file
+    threads: 4
+    resources:
+        singleton=15,
+        mem_gb=10,
+        mem_mb=10000,
+    log:
+        "results/00_sra/{project}/{technique}/{patient_id}__{sra_id}.sra.log",
+    shell:
+        """
+        prefetch --progress --ngc {params.ngc} \
+        -v {wildcards.sra_id} -X 150G -O {params.prefix} \
+         --resume yes 2> >(tee '{log}' >&2)
+        """
+        #-X max cache size --resume yes for resuming the interrupted downloads, standard arror 2> is captured and logged 
+
+
+rule sra2fastq: #we have R1 & R2, but R2 will be later ig
+    input:
+        sra=rules.fetch_sra.output,
+    output:
+        R1="results/01_fastq/{project}/{patient_id}/{technique}/{sra_id}_1.fastq", 
+        R2="results/01_fastq/{project}/{patient_id}/{technique}/{sra_id}_2.fastq", 
+    params:
+        prefix=lambda wc, output: str(pathlib.Path(output.R1).parent),
+    threads: 8  #6-8 cores recommend from documantion of SRAToolkit 
+    priority: 2
+    resources:
+        mem_gb=10,  
+        mem_mb=10000,
+    shell:
+        """
+        fasterq-dump -O {params.prefix} --progress \
+        --threads {threads} {input.sra} 
+        """
+
+
+rule trim:
+    input:
+        R1 = rules.sra2fastq.output.R1,
+        R2 = rules.sra2fastq.output.R2,
+    output:
+        R1="results/trimmed/{project}/{patient_id}/{technique}/{sra_id}_R1.fastq", 
+        R2="results/trimmed/{project}/{patient_id}/{technique}/{sra_id}_R2.fastq", 
+    threads: 8
+    resources:
+        mem_gb=10,    
+    shell: #using default settings as they did in the paper
+        """
+        cutadapt -j {threads} -o {output.R1} -p {output.R2} {input.R1} {input.R2}
+        """  
+
+
+rule star: #untrimmed
+    input:
+        R1=rules.sra2fastq.output.R1,
+        R2=rules.sra2fastq.output.R2
+    output:
+        tbam = temp('results/02_star/raw/{project}/{patient_id}_{technique}_{sra_id}.Aligned.toTranscriptome.out.bam'),
+        gbam = temp('results/02_star/raw/{project}/{patient_id}_{technique}_{sra_id}.Aligned.out.bam'),
+    params:
+        index = lambda wc: config[prj2ref[wc.project]]['star'], 
+        prefix = lambda wc, output: output.gbam.replace("Aligned.out.bam",""),
+        temp_dir = TMPDIR 
+    singularity: config['singularity']
+    resources:
+        mem_gb=64,  
+        mem_mb=64000,
+        tmpdir=TMPDIR 
+    threads: 32
+    shell:
+        '''
+        STAR_TMPDIR=$(mktemp -u -p {params.temp_dir} star_tmp_XXXXXXXX)
+
+        STAR --readFilesIn {input.R1} {input.R2} \
+        --readFilesCommand cat \
+        --runThreadN {threads} \
+        --genomeDir {params.index} \
+        --outFileNamePrefix {params.prefix} \
+        --outSAMtype BAM Unsorted \
+        --outSAMunmapped Within KeepPairs \
+        --quantMode TranscriptomeSAM \
+        --outSAMattributes NH HI AS nM NM \
+        --outSAMattrRGline ID:{wildcards.sra_id} SM:{wildcards.sra_id} LB:{wildcards.sra_id} PL:ILLUMINA \
+        --outTmpDir $STAR_TMPDIR 
+        
+        '''
+
+rule rsem:
+    input: rules.star.output.tbam
+    output:
+        texpr = 'results/03_rsem/raw/{project}/{patient_id}_{technique}_{sra_id}.isoforms.results', #expression on transcriptome counts
+        gexpr = 'results/03_rsem/raw/{project}/{patient_id}_{technique}_{sra_id}.genes.results',
+    params:
+        index = lambda wc: config[prj2ref[wc.project]]['rsem'], 
+        prefix = lambda wc, output: output.texpr.replace(".isoforms.results",""),
+        tmp_dir = lambda wc, output: output.texpr.replace(".isoforms.results","") + "_tmpdir",
+    resources:
+        mem_gb=48,    
+        mem_mb=48000,
+    singularity: config['singularity']
+    threads: 32
+    shell:
+        '''
+        rsem-calculate-expression --paired-end --alignments --estimate-rspd \
+        --num-threads {threads} \
+        --temporary-folder {params.tmp_dir} \
+        --no-bam-output \
+        {input} {params.index} {params.prefix}
+        '''
+
+
+#RSEM_TMPDIR=$(mktemp -u -p {params.temp_dir} rsem_tmp_XXXXXXXX)
+# use rule rsem as rsem_trimmed with:
+#     input:
+#         rules.star_trimmed.output.tbam
+#     output:
+#         texpr = 'results/03_rsem/trimmed/{project}/{patient_id}_{technique}_{sra_id}.isoforms.results', #expression on transcriptome counts
+#         gexpr = 'results/03_rsem/trimmed/{project}/{patient_id}_{technique}_{sra_id}.genes.results',
+
+
+rule fastqc:
+    '''Quality report of BS-seq data''' 
+    input: 
+        R1=rules.sra2fastq.output.R1,
+        R2=rules.sra2fastq.output.R2
+    output: touch("results/fastqc/{project}/{patient_id}/{technique}/{sra_id}.OK")
+    params:
+        extra = "--quiet"
+    threads: 2
+    singularity: config['fastqc_sif']
+    resources:
+        mem_gb=5,    
+    shell: #does it 
+        """
+        fastqc -t {threads} {params.extra} -o $(dirname {output}) {input.R1} && \
+        fastqc -t {threads} {params.extra} -o $(dirname {output}) {input.R2}
+        """
+
+# rule fastqc_trim:
+#     '''Quality report of BS-seq data''' 
+#     input: 
+#         R1=rules.trim.output.R1,
+#         R2=rules.trim.output.R2
+#     output: touch("results/fastqc_trimmed/{project}/{patient_id}/{technique}/{sra_id}.OK")
+#     params:
+#         extra = "--quiet",
+#     threads: 2
+#     singularity: config['fastqc_sif']
+#     resources:
+#         mem_gb=5,    
+#     shell: 
+#         """
+#         fastqc -t {threads} {params.extra} -o $(dirname {output}) {input.R1} && \
+#         fastqc -t {threads} {params.extra} -o $(dirname {output}) {input.R2}
+#         """
+
+# rule TEcount: 
+#     input:
+#         rules.star.output.gbam
+#     output:
+#         "results/03_TEcount/{project}/{patient_id}_{technique}/{sra_id}.cntTable"
+#     params:
+#         GTF= lambda wc: config[prj2ref[wc.project]]['GTF'],
+#         TE_GTF= lambda wc: config[prj2ref[wc.project]]['TE_GTF']
+#     singularity:
+#         config['TEtranscripts_sif']
+#     shell:
+#         """
+#         TEcount -b {input} --format BAM --mode multi --project {wildcards.sra_id}  --GTF {params.GTF} --TE {params.TE_GTF} --outdir $(dirname {output})
+#         """
+
+
+def fmt_bismark_input(R1, R2, wc):
+    if wc.project in r2_issue_prjs:
+        return f"--basename {wc.sra_id} {R1}"
+    else:
+        return f"-1 {R1} -2 {R2}"
+
+
+rule bismark_raw: #run bismark on untrimmed reads #should i use multicores
+    input: 
+        R1 = rules.sra2fastq.output.R1, 
+        R2 = rules.sra2fastq.output.R2
+    output: 'results/bismark/raw/{project}/{technique}/{patient_id}_{sra_id}/{sra_id}_1_bismark_bt2_pe.bam'
+    params:
+        index = lambda wc: config[prj2ref[wc.project]]['bismark'], 
+        input_fmt = lambda wc, input: fmt_bismark_input(input.R1, input.R2, wc),
+        temp_dir = TMPDIR 
+    threads: 32
+    resources:
+        mem_gb=64, 
+        mem_mb=64000,
+    singularity: config['singularity']
+    shell: #-p {threads} - this doesnt work
+        """
+        BISMARK_TMPDIR=$(mktemp -u -p {params.temp_dir} bismark_tmp_XXXXXXXX)
+
+        bismark -q --temp_dir $BISMARK_TMPDIR -o $(dirname {output}) \
+         --non_directional  -p {threads}\
+         --genome_folder {params.index} --multicore 4 \
+         {params.input_fmt} 
+        
+        """    
+
+rule methylation_call_raw: #get cytosine report for untrimmed reads 
+    input:
+        rules.bismark_raw.output
+    output: touch("results/bismark/methylation_call_raw/{project}/{patient_id}_{technique}_{sra_id}/{sra_id}.OK")
+    params:
+        genome_folder = lambda wc: config[prj2ref[wc.project]]['genome_of_interest_dir'],
+        readtype = lambda wc: '-s' if wc.project in r2_issue_prjs else '-p'  
+    singularity: config['singularity']
+    resources:
+        mem_gb=24,    
+        mem_mb=24000,
+    threads: 6
+    shell:
+    #only Cpg context in the report
+        """
+        bismark_methylation_extractor {params.readtype} --gzip --cytosine_report --comprehensive \
+         --parallel {threads} --genome_folder {params.genome_folder} \
+         --bedGraph -o $(dirname {output}) {input} 
+        """   
+# rule methylation_call_raw: #NEW VERSION OF THE METHYLATION CALL - TO BE RUN AFTER LAST BISMARK IS DONE
+#     input: 'results/bismark/raw/{project}/{technique}/{patient_id}_{sra_id}/{sra_id}_1_bismark_bt2_pe.bam'
+#     output: touch("results/bismark/methylation_call_raw/{project}/{patient_id}_{technique}_{sra_id}/{sra_id}.OK")
+#     params:
+#         genome_folder = lambda wc: config[prj2ref[wc.project]]['genome_of_interest_dir'],
+#         readtype = lambda wc: '-s' if wc.project in r2_issue_prjs else '-p'  
+#     singularity: config['singularity']
+#     resources:
+#         mem_gb=24,    
+#         mem_mb=24000,
+#     threads: 6
+#     shell:
+#     #only Cpg context in the report
+#         """
+#         bismark_methylation_extractor {params.readtype} --gzip --cytosine_report --comprehensive \
+#          --parallel {threads} --genome_folder {params.genome_folder} \
+#          --bedGraph -o $(dirname {output}) {input} 
+#         """   
+
+rule ok: # You only have to expand on the last rule in the branch and all depedencies will also be run, i.e. only expand on the methylatio_call, rsem and fastqc 
+    """Collects all output from above and writes the OK file for `rule all`."""
+    input:
+        #a = expand(rules.rsem.output, zip, project=PROJECTS * len(rnaseq_df), technique=rnaseq_df['Assay Type'].tolist(), patient_id=rnaseq_df['patient_id'].tolist(), sra_id=rnaseq_df['Run'].tolist()), 
+        #c = expand(rules.methylation_call_raw.output, zip, project=PROJECTS * len(wgbs_df), technique=wgbs_df['Assay Type'].tolist(), patient_id=wgbs_df['patient_id'].tolist(), sra_id=wgbs_df['Run'].tolist()),
+        a = expand(rules.rsem.output, zip, project='DNMT1', technique='Rna-seq', patient_id='1', sra_id='SRR12646267'), 
+        c = expand(rules.methylation_call_raw.output, zip, project='DNMT1', technique='Bisulfite-seq', patient_id='1', sra_id='SRR12646267'),
+
+    output: 
+        temp(touch('results/OK'))
+
+
+
+
+#expand(rules.fastqc.output, zip, project=PROJECTS * len(wgbs_df), sra_id=wgbs_df['Run']),
+        
+# expand(rules.methylation_call_trimmed.output, zip, project=PROJECTS, sra_id=wgbs_df['Run']),
+# expand(rules.methylation_call_raw.output, zip, project=PROJECTS, sra_id=wgbs_df['Run']),
+# expand(rules.rsem.output, zip, project=PROJECTS, sra_id=rnaseq_df['Run']),
+        #d = expand(rules.methylation_call_trimmed.output, zip, project=PROJECTS * len(wgbs_df), technique=wgbs_df['Assay Type'].tolist(), patient_id=wgbs_df['patient_id'].tolist(), sra_id=wgbs_df['Run'].tolist()),
+        #e = expand(rules.fastqc.output, zip , project=PROJECTS* len(wgbs_df), technique=wgbs_df['Assay Type'].tolist(), patient_id=wgbs_df['patient_id'].tolist(), sra_id=wgbs_df['Run'].tolist()),
+        #f = expand(rules.fastqc_trim.output, zip , project=PROJECTS* len(wgbs_df), technique=wgbs_df['Assay Type'].tolist(), patient_id=wgbs_df['patient_id'].tolist(), sra_id=wgbs_df['Run'].tolist()),
+                #b = expand(rules.rsem_trimmed.output, zip, project=PROJECTS * len(rnaseq_df), technique=rnaseq_df['Assay Type'].tolist(), patient_id=rnaseq_df['patient_id'].tolist(), sra_id=rnaseq_df['Run'].tolist()),
+        #a = expand(rules.TEcount.output, zip, project=PROJECTS * len(rnaseq_df), technique=rnaseq_df['Assay Type'].tolist(), patient_id=rnaseq_df['patient_id'].tolist(), sra_id=rnaseq_df['Run'].tolist()), 
+        #a = expand(rules.star2.output, zip, project=PROJECTS * len(rnaseq_df), technique=rnaseq_df['Assay Type'].tolist(), patient_id=rnaseq_df['patient_id'].tolist(), sra_id=rnaseq_df['Run'].tolist()),

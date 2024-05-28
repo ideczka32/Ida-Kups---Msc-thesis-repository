@@ -1,0 +1,149 @@
+"""
+Analysis pipeline for 
+
+"""
+
+import sys
+import gzip
+import json
+import pandas as pd
+import os
+import mut_stats
+import expression
+import numpy as np 
+
+
+localrules: all, ok
+
+configfile: 'config.yaml'
+
+rand_expr_file_path = '/work/iku/exp1019-cancer-epigenetics-and-ervs/00_mut_and_ERV/expression_data/TCGA-STAD/TCGA-ZA-A8F6_dac95dc4-9b83-4c71-abad-3fd8588d98cf.genes.results'
+manifest_df = pd.read_csv(config['manifest'], sep = '\t')
+PATIENT = manifest_df['id'].tolist()
+metadata_path = '/work/iku/exp1019-cancer-epigenetics-and-ervs/00_mut_and_ERV/metadata.cart.2024-02-12.json'
+with open(metadata_path, 'r') as file:
+    metadata = json.load(file)
+
+
+# Some samples do not have vcf files
+#gdc_df = pd.read_csv(config['manifest'], sep='\t')
+
+GDC_TOKEN_FN = '../access_tokens/GDC_TOKEN' #for autheticating the access to gdc
+
+rule all:
+    input: 'results/OK'
+
+
+TMPDIR = '/scratch'
+
+
+rule fetch:
+    """Downloads VEP annotated Mutect2 somatic variant calls"""
+    output: directory('results/00_fetch/{patient}')
+    params:
+        token = GDC_TOKEN_FN, 
+    log: 'results/00_fetch/{patient}.log'
+    resources:
+        tmpdir=TMPDIR
+    threads: 1
+    shell:
+        '''
+        ODIR=results/00_fetch
+        mkdir -p $ODIR &&
+        gdc-client download -t {params.token} -m {config[manifest]} -d $ODIR  --no-related-files   
+        '''
+
+
+
+
+rule mut_stat:
+    """Counts number of various mutations in TET and DMNT genes""" 
+    input: rules.fetch.output
+    output: 'results/01_mut_stat/{patient}.json'
+    run:
+        project_dir = input[0]
+        patient_ID = os.path.basename(os.path.normpath(project_dir))
+        #get the vcf file from the folder
+        vcf_file = mut_stats.get_vcf(project_dir)
+        if vcf_file:
+            mutation_stats = mut_stats.get_mut_stats(project_dir, vcf_file)
+            mutation_stats['patient_ID'] = patient_ID
+            mutation_stats['filename'] = vcf_file
+            
+            mut_stats_df = pd.DataFrame([mutation_stats])
+
+            #define the output path
+            output_path = str(output[0])
+            mut_stats_df.to_json(output_path, orient = 'records', lines = True)
+        else:
+            open(output[0], 'w').close()
+
+
+
+rule aggregate:
+    """Collects all TET and DMNT mutation stats"""
+    input: lambda wc: expand('results/01_mut_stat/{patient}.json', patient = PATIENT)
+    output: 'results/02_aggregate/full_results.tsv'
+    run:
+        aggregated_df = pd.DataFrame()
+
+        for f in input:
+            if os.path.getsize(f) > 0:
+                df = pd.read_json(f, orient='records', lines=True)
+                aggregated_df = pd.concat([aggregated_df, df], ignore_index=True)
+            else:
+                print(f"Skipping empty file: {f}")
+
+        output_path = str(output[0])
+        aggregated_df.to_csv(output_path, sep = '\t', index = False)
+
+
+rule add_ervs:
+    input: 'results/02_aggregate/full_results.tsv'
+    output: 'results/03_add_ervs/with_ervs.tsv'
+    run:
+        df = pd.read_csv(str(input), sep='\t')
+        df['ERV_breadth'] = np.nan
+        df['ERV_abundance'] = np.nan
+        df['patient_ID_expr'] = ''
+
+        for index, row in df.iterrows():
+            info = [] 
+            # get the patient ID
+            patient_ID = expression.get_patient_ID(row['filename'], metadata)
+            df.at[index, 'patient_ID_expr'] = patient_ID
+            info.append(patient_ID)
+
+            if patient_ID is not None:
+                # get the expression folder
+                expression_folder = expression.get_expression_folder(row['filename'], config['expression_data'])
+                info.append(expression_folder)
+                # find the expression file if there exists an expression folder
+                if expression_folder is not None:
+                    expressionfile = expression.find_expression_file(patient_ID, expression_folder)
+                    info.append(expressionfile)
+                    # read the folder into df and only keep the ERV's rows
+                    if expressionfile is not None:
+                        expression_df = pd.read_csv(expressionfile, sep='\t')
+                        #convert TPM to int
+                        expression_df['TPM'] = expression_df['TPM'].astype(int)
+                        df.at[index, 'ERV_breadth'] = expression.count_breadth(expression_df)
+                        df.at[index, 'ERV_abundance'] = expression.count_abundance(expression_df)
+                        info.append(expression.count_breadth(expression_df))
+                        info.append(expression.count_abundance(expression_df))
+            with open('info.txt', 'a') as file:
+                file.write(str(info))
+                file.write('\n')
+        df.to_csv(output[0], sep='\t', index=False)
+        
+
+
+
+
+rule ok:
+    """Collects all output from above and writes the OK file for `rule all`."""
+    input: rules.add_ervs.output
+    output: temp(touch('results/OK'))
+  
+
+  
